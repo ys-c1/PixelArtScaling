@@ -121,18 +121,156 @@ __version__ = '2026.8.6.312'
 __maintainer__ = 'Ilya Razmanov'
 __email__ = 'ilyarazmanov@gmail.com'
 __status__ = 'Production'
-__all__ = ['scaleNx']
+__all__ = ['scaleNx', 'set_cache_maxsize', 'set_cache_policy', 'cache_clear', 'cache_info']
 
+from collections import OrderedDict
+from hashlib import sha256
+from sys import getsizeof
 from typing import Literal
 
 from .scalenx import scale2x, scale3x
 from .scalenxsfx import scale2x as scale2xsfx
 from .scalenxsfx import scale3x as scale3xsfx
 
+""" ╔═══════════════════════════════════════╗
+    ║ Export result cache                   ║
+    ║ ------------------------------------- ║
+    ║ Repeatedly exporting the same image   ║
+    ║ with the same parameters no longer    ║
+    ║ recomputes the rescaling: results are ║
+    ║ cached by (input hash, params hash).  ║
+    ╚═══════════════════════════════════════╝ """
+
+_RESULT_CACHE: OrderedDict[tuple[int, bool, str], list[list[list[int]]]] = OrderedDict()
+"""Cached rescaling results, ordered for eviction. Keys are ``(n, sfx, input hash)``."""
+
+_CACHE_MAXSIZE = 16
+"""Maximal number of cached results. Configurable via `set_cache_maxsize`."""
+
+_CACHE_POLICY = 'lru'
+"""Eviction policy, ``'lru'`` or ``'fifo'``. Configurable via `set_cache_policy`."""
+
+_CACHE_HITS = 0
+"""Number of cache hits since last `cache_clear`."""
+
+_CACHE_MISSES = 0
+"""Number of cache misses since last `cache_clear`."""
+
+_CACHE_POLICIES = ('lru', 'fifo')
+"""Supported eviction policies."""
+
+
+def _image_hash(image3d: list[list[list[int]]]) -> str:
+    """Return content hash of ``image3d``, unambiguous for nested lists of int."""
+
+    return sha256(repr(image3d).encode('utf-8')).hexdigest()
+
+
+def _copy_image(image3d: list[list[list[int]]]) -> list[list[list[int]]]:
+    """Fast deep copy of uniform image nested list; much faster than ``copy.deepcopy`` here."""
+
+    return [[pixel[:] for pixel in row] for row in image3d]
+
+
+def _deep_sizeof(obj, _seen: set | None = None) -> int:
+    """Recursively measure memory footprint of nested lists/tuples, in bytes."""
+
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return 0
+    _seen.add(obj_id)
+    size = getsizeof(obj)
+    if isinstance(obj, (list, tuple)):
+        size += sum(_deep_sizeof(item, _seen) for item in obj)
+    return size
+
+
+def _evict() -> None:
+    """Evict oldest/least recently used entries until cache fits `maxsize`."""
+
+    while len(_RESULT_CACHE) > _CACHE_MAXSIZE:
+        _RESULT_CACHE.popitem(last=False)  # front is oldest (FIFO) / least recently used (LRU)
+
+
+def set_cache_maxsize(maxsize: int) -> None:
+    """Set maximal number of cached rescaling results.
+
+    :param int maxsize: new cache capacity, must be a positive integer.
+        Excess entries are evicted immediately according to current policy.
+    :raises ValueError: if ``maxsize`` is not a positive integer
+        (in particular, cache of size 0 is not allowed).
+
+    """
+
+    global _CACHE_MAXSIZE
+    if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 1:
+        raise ValueError(f'Cache maxsize must be a positive integer, got `{maxsize}`.\nCache of size 0 is not allowed; use `cache_clear()` to empty the cache instead.')
+    _CACHE_MAXSIZE = maxsize
+    _evict()
+
+
+def set_cache_policy(policy: Literal['lru', 'fifo']) -> None:
+    """Set cache eviction policy.
+
+    :param str policy: ``'lru'`` (evict least recently used entry)
+        or ``'fifo'`` (evict oldest entry).
+    :raises ValueError: if ``policy`` is not one of supported policies.
+
+    """
+
+    global _CACHE_POLICY
+    if policy not in _CACHE_POLICIES:
+        raise ValueError(f'Unknown cache policy `{policy}`.\nOnly {_CACHE_POLICIES} policies are supported.')
+    _CACHE_POLICY = policy
+
+
+def cache_clear() -> None:
+    """Empty the result cache and reset hit/miss statistics."""
+
+    global _CACHE_HITS, _CACHE_MISSES
+    _RESULT_CACHE.clear()
+    _CACHE_HITS = _CACHE_MISSES = 0
+
+
+def cache_info() -> dict:
+    """Return current cache state and statistics as dict:
+
+    ``maxsize`` - configured capacity;
+    ``policy`` - configured eviction policy;
+    ``size`` - number of cached results;
+    ``hits``, ``misses`` - statistics since last `cache_clear`;
+    ``memory`` - approximate memory held by cached results, in bytes.
+
+    """
+
+    return {
+        'maxsize': _CACHE_MAXSIZE,
+        'policy': _CACHE_POLICY,
+        'size': len(_RESULT_CACHE),
+        'hits': _CACHE_HITS,
+        'misses': _CACHE_MISSES,
+        'memory': _deep_sizeof(list(_RESULT_CACHE.values())),
+    }
+
 
 def scaleNx(source_image: list[list[list[int]]], n: Literal[2, 3], sfx: bool) -> list[list[list[int]]]:
     """ScaleNx image rescaling, configurable via ``n`` and ``sfx`` options.
     ----
+
+    Results are cached by ``(n, sfx, source image content hash)`` key:
+    repeated rescaling of the same image with the same parameters
+    reuses the cached result instead of recomputing it.
+    Cache capacity and eviction policy are configurable via
+    `set_cache_maxsize` and `set_cache_policy`; see also
+    `cache_info` and `cache_clear`.
+
+    .. note:: Cached results are shared objects: repeated calls with
+        the same input return the same nested list object.
+        Treat the returned image as read-only; mutating it corrupts
+        the cache. This matches the fact that rescaling results
+        may alias source image pixels.
 
     :param source_image: source image 3D nested list;
         coordinate system match Photoshop, *i.e.* origin is top left corner,
@@ -145,17 +283,39 @@ def scaleNx(source_image: list[list[list[int]]], n: Literal[2, 3], sfx: bool) ->
     :rtype: list[list[list[int]]]
 
     """
+
+    global _CACHE_HITS, _CACHE_MISSES
+
+    key = (n, sfx, _image_hash(source_image))
+
+    if key in _RESULT_CACHE:
+        _CACHE_HITS += 1
+        if _CACHE_POLICY == 'lru':
+            _RESULT_CACHE.move_to_end(key)
+        # ↓ Direct reuse of cached result; copying it would cost
+        #   more than recomputing, defeating the cache purpose
+        return _RESULT_CACHE[key]
+
+    _CACHE_MISSES += 1
+
     if sfx:
         if n == 2:
-            return scale2xsfx(source_image)
+            result = scale2xsfx(source_image)
         elif n == 3:
-            return scale3xsfx(source_image)
+            result = scale3xsfx(source_image)
         else:
             raise ValueError(f'Attempt to use nonexistent method n=`{n}`\nOnly methods n=2 and n=3 allowed.')
     else:
         if n == 2:
-            return scale2x(source_image)
+            result = scale2x(source_image)
         elif n == 3:
-            return scale3x(source_image)
+            result = scale3x(source_image)
         else:
             raise ValueError(f'Attempt to use nonexistent method n=`{n}`\nOnly methods n=2 and n=3 allowed.')
+
+    # ↓ Cached copy must be independent since result pixels
+    #   may alias source pixels, and source may be mutated later
+    _RESULT_CACHE[key] = _copy_image(result)
+    _evict()
+
+    return result
