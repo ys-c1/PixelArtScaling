@@ -121,13 +121,14 @@ __version__ = '2026.8.6.312'
 __maintainer__ = 'Ilya Razmanov'
 __email__ = 'ilyarazmanov@gmail.com'
 __status__ = 'Production'
-__all__ = ['scaleNx']
+__all__ = ['scaleNx', 'resample', 'Kernel', 'KERNELS', 'get_kernel']
 
 from typing import Literal
 
 from .scalenx import scale2x, scale3x
 from .scalenxsfx import scale2x as scale2xsfx
 from .scalenxsfx import scale3x as scale3xsfx
+from .resample import KERNELS, Kernel, get_kernel, resample
 
 
 def scaleNx(source_image: list[list[list[int]]], n: Literal[2, 3], sfx: bool) -> list[list[list[int]]]:
